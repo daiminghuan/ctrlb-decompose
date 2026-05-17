@@ -91,7 +91,7 @@ ctrlb-decompose uses a **two-stage normalization and clustering pipeline** that 
 
 ### Stage 1 — CLP Encoding
 
-[CLP (Compact Log Pattern)](https://www.cs.toronto.edu/~zzhao/clp/) encoding normalizes variable tokens into typed placeholders, so structurally identical lines produce identical logtypes regardless of the actual values:
+[CLP (Compressed Log Processor)](https://www.usenix.org/system/files/osdi21-rodrigues.pdf) encoding normalizes variable tokens into typed placeholders, so structurally identical lines produce identical logtypes regardless of the actual values:
 
 ```
 Input:   "Request from 10.0.1.15 completed in 45ms status=200"
