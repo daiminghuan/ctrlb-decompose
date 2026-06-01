@@ -31,8 +31,6 @@ pub fn format(
     ));
 
     // Partition patterns into critical vs high-volume.
-    // Critical: only patterns with keyword severity >= Warn (ERROR, WARN, etc.).
-    // Anomaly detection is left to the LLM — we just surface the data.
     let mut critical: Vec<&PatternStats> = Vec::new();
     let mut high_volume: Vec<&PatternStats> = Vec::new();
 
@@ -56,11 +54,7 @@ pub fn format(
         sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // High-volume already sorted by count desc (from sorted_patterns), just take top 5
-    let high_volume_limit = 5;
-
     if critical.is_empty() {
-        // Fallback: no critical patterns, show flat list sorted by count (current behavior)
         let top_n = opts.top.min(patterns.len());
         let shown_lines: u64 = patterns.iter().take(top_n).map(|p| p.count).sum();
         let shown_pct = if total_lines > 0 {
@@ -75,19 +69,18 @@ pub fn format(
             format_pattern_full(&mut out, rank, pattern, total_lines, store, scores);
         }
     } else {
-        // Two-section layout
-        let critical_n = opts.top.min(critical.len());
-
+        // Critical: show all
         out.push_str(&format!(
             "### Critical Patterns (errors, warnings): {}\n",
-            critical_n
+            critical.len()
         ));
 
-        for (rank, pattern) in critical.iter().take(critical_n).enumerate() {
+        for (rank, pattern) in critical.iter().enumerate() {
             format_pattern_full(&mut out, rank, pattern, total_lines, store, scores);
         }
 
-        let hv_n = high_volume_limit.min(high_volume.len());
+        // High-volume: controlled by --top
+        let hv_n = opts.top.min(high_volume.len());
         if hv_n > 0 {
             out.push_str(&format!(
                 "\n### High-Volume Patterns (top {} by count):\n",
@@ -107,7 +100,6 @@ pub fn format(
                     labeled_template,
                     pattern.count
                 ));
-                // Always show 1 example for context
                 if let Some(ex) = pattern.example_lines.items().first() {
                     out.push_str(&format!("   e.g. {}\n", truncate_long_tokens(ex)));
                 }

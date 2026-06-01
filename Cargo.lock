@@ -324,6 +324,7 @@ dependencies = [
  "insta",
  "lru",
  "once_cell",
+ "rayon",
  "regex",
  "serde",
  "serde-wasm-bindgen",
