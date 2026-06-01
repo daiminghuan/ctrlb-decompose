@@ -13,6 +13,103 @@ pub struct PipelineParsedLog {
     pub count: u64,
 }
 
+/// Pre-encoded CLP data (produced in parallel, consumed serially by Drain3).
+pub struct ClpEncoded {
+    pub logtype: String,
+    pub encoded_vars: Vec<EightByteEncodedVariable>,
+    pub dictionary_vars: Vec<String>,
+}
+
+/// Encode a line using CLP (stateless, thread-safe with per-thread context).
+pub fn clp_encode_line(ctx: &mut EncodingContext<EightByteEncodedVariable>, stripped: &str) -> ClpEncoded {
+    let (lt, ev, dv) = ctx.encode_message(stripped);
+    ClpEncoded {
+        logtype: lt.to_string(),
+        encoded_vars: ev.to_vec(),
+        dictionary_vars: dv.to_vec(),
+    }
+}
+
+/// Create a new CLP encoding context (one per thread).
+pub fn new_clp_context() -> EncodingContext<EightByteEncodedVariable> {
+    EncodingContext::new(2048, 128)
+}
+
+/// Result from Drain3 clustering (serial step output).
+pub struct DrainResult {
+    pub pattern_id: PatternID,
+    pub template: String,
+    pub count: u64,
+}
+
+/// Merge CLP variables with Drain3 template — pure function, safe to call in parallel.
+pub fn merge_variables(
+    drain_template: &str,
+    logtype: &str,
+    encoded_vars: &[EightByteEncodedVariable],
+    dictionary_vars: &[String],
+    pattern_id: PatternID,
+    count: u64,
+) -> PipelineParsedLog {
+    let drain_tokens: Vec<&str> = drain_template.split_whitespace().collect();
+    let logtype_tokens: Vec<&str> = logtype.split_whitespace().collect();
+
+    let mut display_parts: Vec<String> = Vec::new();
+    let mut variables: Vec<TypedVariable> = Vec::new();
+
+    let mut encoded_cursor: usize = 0;
+    let mut dict_cursor: usize = 0;
+    let mut content_encoded_cursor: usize = 0;
+    let mut content_dict_cursor: usize = 0;
+
+    for (i, drain_tok) in drain_tokens.iter().enumerate() {
+        if *drain_tok == "<*>" {
+            if i < logtype_tokens.len() {
+                let lt_tok = logtype_tokens[i];
+                let raw = decode_clp_fragment(
+                    lt_tok,
+                    encoded_vars,
+                    &mut content_encoded_cursor,
+                    dictionary_vars,
+                    &mut content_dict_cursor,
+                );
+                variables.push(TypedVariable {
+                    var_type: classify_variable(&raw),
+                    raw,
+                });
+            }
+            display_parts.push("<*>".to_string());
+        } else {
+            let lt_tok = if i < logtype_tokens.len() {
+                logtype_tokens[i]
+            } else {
+                drain_tok
+            };
+
+            advance_clp_cursors(lt_tok, &mut content_encoded_cursor, &mut content_dict_cursor);
+
+            let (display_tok, tok_vars) = expand_clp_placeholders(
+                drain_tok,
+                encoded_vars,
+                &mut encoded_cursor,
+                dictionary_vars,
+                &mut dict_cursor,
+            );
+            display_parts.push(display_tok);
+            variables.extend(tok_vars);
+        }
+    }
+
+    let display_template = display_parts.join(" ");
+
+    PipelineParsedLog {
+        pattern_id,
+        display_template,
+        variables,
+        count,
+    }
+}
+
 /// CLP → Drain3 pipeline.
 ///
 /// CLP normalizes each line by replacing variables (UUIDs, numbers, hex IDs)
@@ -39,77 +136,27 @@ impl ClpDrainPipeline {
             (lt.to_string(), ev.to_vec(), dv.to_vec())
         };
 
-        // Step 2: Feed CLP logtype to Drain3 for structural clustering
-        let parsed = self.drain.extract_template_and_vars(&logtype);
+        // Step 2+3: Drain3 + merge
+        self.process_pre_encoded(logtype, encoded_vars, dictionary_vars)
+    }
 
-        // Step 3: Merge CLP variables + Drain3 wildcards into unified output
-        let drain_template = &parsed.template;
-        let drain_tokens: Vec<&str> = drain_template.split_whitespace().collect();
-        let logtype_tokens: Vec<&str> = logtype.split_whitespace().collect();
+    /// Process pre-encoded CLP data through Drain3 + merge (serial step).
+    pub fn process_pre_encoded(
+        &mut self,
+        logtype: String,
+        encoded_vars: Vec<EightByteEncodedVariable>,
+        dictionary_vars: Vec<String>,
+    ) -> PipelineParsedLog {
+        let drain_result = self.drain_only(&logtype);
+        merge_variables(&drain_result.template, &logtype, &encoded_vars, &dictionary_vars, drain_result.pattern_id, drain_result.count)
+    }
 
-        let mut display_parts: Vec<String> = Vec::new();
-        let mut variables: Vec<TypedVariable> = Vec::new();
-
-        // Cursors into CLP variable arrays
-        let mut encoded_cursor: usize = 0;
-        let mut dict_cursor: usize = 0;
-
-        // Also track a global cursor across the full logtype to handle
-        // CLP variables consumed by tokens we iterate over.
-        // We need a second pair of cursors for the content (logtype) side
-        // to advance past CLP vars in `<*>` positions.
-        let mut content_encoded_cursor: usize = 0;
-        let mut content_dict_cursor: usize = 0;
-
-        for (i, drain_tok) in drain_tokens.iter().enumerate() {
-            if *drain_tok == "<*>" {
-                // Drain3 wildcard: the entire logtype token at this position varied.
-                // Decode the original text from the CLP logtype token + vars.
-                if i < logtype_tokens.len() {
-                    let lt_tok = logtype_tokens[i];
-                    let raw = decode_clp_fragment(
-                        lt_tok,
-                        &encoded_vars,
-                        &mut content_encoded_cursor,
-                        &dictionary_vars,
-                        &mut content_dict_cursor,
-                    );
-                    variables.push(TypedVariable {
-                        var_type: classify_variable(&raw),
-                        raw,
-                    });
-                }
-                display_parts.push("<*>".to_string());
-            } else {
-                // Fixed token in the Drain3 template. It may contain CLP placeholders.
-                let lt_tok = if i < logtype_tokens.len() {
-                    logtype_tokens[i]
-                } else {
-                    drain_tok
-                };
-
-                // Advance content cursors for this token (mirrors what we do with display cursors)
-                advance_clp_cursors(lt_tok, &mut content_encoded_cursor, &mut content_dict_cursor);
-
-                // Build display token: replace each CLP placeholder with <*> and extract vars
-                let (display_tok, tok_vars) = expand_clp_placeholders(
-                    drain_tok,
-                    &encoded_vars,
-                    &mut encoded_cursor,
-                    &dictionary_vars,
-                    &mut dict_cursor,
-                );
-                display_parts.push(display_tok);
-                variables.extend(tok_vars);
-            }
-        }
-
-        let display_template = display_parts.join(" ");
-
-        PipelineParsedLog {
+    /// Drain3 clustering only — serial, returns pattern info.
+    pub fn drain_only(&mut self, logtype: &str) -> DrainResult {
+        let parsed = self.drain.extract_template_and_vars(logtype);
+        DrainResult {
             pattern_id: parsed.pattern_id,
-            display_template,
-            variables,
+            template: parsed.template,
             count: parsed.count,
         }
     }

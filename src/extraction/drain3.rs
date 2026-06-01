@@ -76,65 +76,108 @@ static RE_HEX_ID: Lazy<Regex> = Lazy::new(|| {
 });
 
 /// Classify a raw variable string into a VarType.
-/// Order matters: more specific patterns are checked first.
+/// Uses fast character checks first, falling back to regex only when needed.
 pub fn classify_variable(value: &str) -> VarType {
-    // UUID (must be before HexID since UUIDs contain hex chars)
-    if RE_UUID.is_match(value) {
-        return VarType::UUID;
+    let bytes = value.as_bytes();
+    let len = bytes.len();
+
+    if len == 0 {
+        return VarType::String;
     }
 
-    // IPv4 (with optional port)
-    if RE_IPV4.is_match(value) {
-        // Validate octets are 0-255
-        let ip_part = value.split(':').next().unwrap_or(value);
-        let valid = ip_part
-            .split('.')
-            .all(|octet| octet.parse::<u16>().is_ok_and(|n| n <= 255));
-        if valid {
-            return VarType::IPv4;
+    let first = bytes[0];
+
+    // UUID: exactly 36 chars, pattern xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    if len == 36 && bytes[8] == b'-' && bytes[13] == b'-' && bytes[18] == b'-' && bytes[23] == b'-' {
+        if value.bytes().enumerate().all(|(i, b)| {
+            if i == 8 || i == 13 || i == 18 || i == 23 { b == b'-' }
+            else { b.is_ascii_hexdigit() }
+        }) {
+            return VarType::UUID;
         }
     }
 
-    // IPv6
-    if RE_IPV6.is_match(value) {
-        return VarType::IPv6;
-    }
+    // Fast path: starts with digit or '-' followed by digit
+    let starts_numeric = first.is_ascii_digit() || (first == b'-' && len > 1 && bytes[1].is_ascii_digit());
 
-    // Duration (number + time unit suffix) — before Integer/Float since "45ms" starts with digits
-    if RE_DURATION.is_match(value) {
-        return VarType::Duration;
-    }
-
-    // ISO timestamp
-    if RE_ISO_TIMESTAMP.is_match(value) {
-        return VarType::Timestamp;
-    }
-
-    // Float (must be before Integer since "3.14" contains digits)
-    if let Some(stripped) = value.strip_prefix('-') {
-        if stripped.contains('.') && stripped.parse::<f64>().is_ok() {
-            return VarType::Float;
+    if starts_numeric {
+        // Duration: ends with time unit suffix
+        if len >= 2 {
+            let last = bytes[len - 1];
+            let is_duration = match last {
+                b's' => {
+                    if len >= 3 {
+                        match bytes[len - 2] {
+                            b'n' | b'm' | b'u' => true, // ns, ms, us
+                            _ => bytes[len - 2].is_ascii_digit(), // plain 's'
+                        }
+                    } else {
+                        true
+                    }
+                }
+                b'm' | b'h' => bytes[len - 2].is_ascii_digit(),
+                _ => false,
+            };
+            if is_duration && RE_DURATION.is_match(value) {
+                return VarType::Duration;
+            }
         }
-    } else if value.contains('.') && value.parse::<f64>().is_ok() {
-        // Only classify as float if it has a decimal point — avoids "123" being Float
-        return VarType::Float;
+
+        // Check for dots — could be IPv4 or Float
+        if value.contains('.') {
+            // IPv4: digit.digit.digit.digit with optional :port
+            let ip_part = value.split(':').next().unwrap_or(value);
+            let dot_count = ip_part.bytes().filter(|&b| b == b'.').count();
+            if dot_count == 3 && RE_IPV4.is_match(value) {
+                let valid = ip_part
+                    .split('.')
+                    .all(|octet| octet.parse::<u16>().is_ok_and(|n| n <= 255));
+                if valid {
+                    return VarType::IPv4;
+                }
+            }
+
+            // Float
+            let check = if first == b'-' { &value[1..] } else { value };
+            if check.bytes().all(|b| b.is_ascii_digit() || b == b'.') && check.parse::<f64>().is_ok() {
+                return VarType::Float;
+            }
+        }
+
+        // ISO timestamp: starts with 4 digits then '-'
+        if len >= 19 && bytes[4] == b'-' && bytes[7] == b'-' {
+            return VarType::Timestamp;
+        }
+
+        // Integer
+        if value.parse::<i64>().is_ok() {
+            return VarType::Integer;
+        }
     }
 
-    // Integer
-    if value.parse::<i64>().is_ok() {
-        return VarType::Integer;
+    // IPv6: contains multiple ':'
+    if value.contains(':') && value.bytes().filter(|&b| b == b':').count() >= 2 {
+        if RE_IPV6.is_match(value) {
+            return VarType::IPv6;
+        }
     }
 
-    // HexID (at least 4 hex chars, checked after Integer to avoid classifying "1234" as hex)
-    if RE_HEX_ID.is_match(value) {
-        // Make sure it actually contains a-f chars (otherwise it's just a number)
-        let hex_part = value.strip_prefix("0x").unwrap_or(value);
-        if hex_part.chars().any(|c| c.is_ascii_hexdigit() && !c.is_ascii_digit()) {
+    // HexID: starts with 0x or is all hex with at least one a-f
+    if len >= 4 {
+        let hex_part = if bytes[0] == b'0' && bytes[1] == b'x' { &value[2..] } else { value };
+        if hex_part.len() >= 4
+            && hex_part.bytes().all(|b| b.is_ascii_hexdigit())
+            && hex_part.bytes().any(|b| b.is_ascii_hexdigit() && !b.is_ascii_digit())
+        {
             return VarType::HexID;
         }
     }
 
-    // Fallback
+    // µs duration (multi-byte prefix)
+    if value.ends_with("µs") && RE_DURATION.is_match(value) {
+        return VarType::Duration;
+    }
+
     VarType::String
 }
 
@@ -256,56 +299,55 @@ impl Drain {
 
     pub fn train(&mut self, content: &str) -> LogCluster {
         let content_tokens = self.get_content_as_tokens(content);
+        let (id, size) = self.train_with_tokens(&content_tokens);
+        if let Some(cluster) = self.id_to_cluster.peek(id) {
+            LogCluster {
+                log_template_tokens: cluster.log_template_tokens.clone(),
+                id: cluster.id,
+                size: cluster.size,
+            }
+        } else {
+            LogCluster {
+                log_template_tokens: Vec::new(),
+                id,
+                size,
+            }
+        }
+    }
 
-        let match_cluster_opt = {
-            // Clone needed values to avoid borrowing conflicts
-            let sim_th = self.config.sim_th;
+    fn train_with_tokens(&mut self, content_tokens: &[String]) -> (usize, usize) {
+        let sim_th = self.config.sim_th;
+        let match_id = self.tree_search_impl_fast(content_tokens, sim_th, false);
 
-            self.tree_search_impl(&content_tokens, sim_th, false)
-        };
-
-        // Match no existing log cluster
-        if match_cluster_opt.is_none() {
+        if let Some(matched_id) = match_id {
+            // Update template in-place — only clone param_string when a token actually differs
+            if let Some(cluster) = self.id_to_cluster.get(matched_id) {
+                let template_len = cluster.log_template_tokens.len();
+                let check_len = content_tokens.len().min(template_len);
+                for i in 0..check_len {
+                    if cluster.log_template_tokens[i] != self.config.param_string
+                        && content_tokens[i] != cluster.log_template_tokens[i]
+                    {
+                        cluster.log_template_tokens[i].clear();
+                        cluster.log_template_tokens[i].push_str(&self.config.param_string);
+                    }
+                }
+                cluster.size += 1;
+                (matched_id, cluster.size)
+            } else {
+                panic!("Cluster not found in cache after match");
+            }
+        } else {
             self.clusters_counter += 1;
             let cluster_id = self.clusters_counter;
-
-            let match_cluster = LogCluster {
-                log_template_tokens: content_tokens.clone(),
+            self.add_seq_to_prefix_tree_helper(cluster_id, content_tokens);
+            let cluster = LogCluster {
+                log_template_tokens: content_tokens.to_vec(),
                 id: cluster_id,
                 size: 1,
             };
-
-            self.id_to_cluster.set(cluster_id, match_cluster);
-            // let mut root_node = self.root_node.clone();
-            // self.add_seq_to_prefix_tree(&mut root_node, cluster_id, &content_tokens);
-            self.add_seq_to_prefix_tree_helper(cluster_id, &content_tokens);
-
-            // Return a new copy of the cluster
-            LogCluster {
-                log_template_tokens: content_tokens,
-                id: cluster_id,
-                size: 1,
-            }
-        } else {
-            let match_cluster = match_cluster_opt.unwrap();
-            let new_template_tokens =
-                self.create_template(&content_tokens, &match_cluster.log_template_tokens);
-
-            // Update the cluster in the cache
-            if let Some(cluster) = self.id_to_cluster.get(match_cluster.id) {
-                cluster.log_template_tokens = new_template_tokens.clone();
-                cluster.size += 1;
-
-                // Return a new copy of the updated cluster
-                LogCluster {
-                    log_template_tokens: new_template_tokens,
-                    id: match_cluster.id,
-                    size: cluster.size,
-                }
-            } else {
-                // This should not happen if the cache is working correctly
-                panic!("Cluster not found in cache after match");
-            }
+            self.id_to_cluster.set(cluster_id, cluster);
+            (cluster_id, 1)
         }
     }
 
@@ -318,51 +360,59 @@ impl Drain {
     }
 
     fn get_content_as_tokens(&self, content: &str) -> Vec<String> {
-        let mut content = content.trim().to_string();
-        for extra_delimiter in &self.config.extra_delimiters {
-            content = content.replace(extra_delimiter, " ");
+        if self.config.extra_delimiters.is_empty() {
+            content.split_whitespace().map(|s| s.to_string()).collect()
+        } else {
+            let mut content = content.trim().to_string();
+            for extra_delimiter in &self.config.extra_delimiters {
+                content = content.replace(extra_delimiter, " ");
+            }
+            content.split_whitespace().map(|s| s.to_string()).collect()
         }
-        content.split_whitespace().map(|s| s.to_string()).collect()
     }
 
     pub fn extract_template_and_vars(&mut self, content: &str) -> ParsedLog {
         let content_tokens = self.get_content_as_tokens(content);
 
-        // First train/match to get the cluster
-        let cluster = self.train(content);
+        // Train (one tokenization only) and get cluster id
+        let (cluster_id, cluster_size) = self.train_with_tokens(&content_tokens);
 
         // Extract variables by comparing the template with the original content
         let mut variables = Vec::new();
-
-        for (i, token) in content_tokens.iter().enumerate() {
-            if i < cluster.log_template_tokens.len()
-                && cluster.log_template_tokens[i] == self.config.param_string
-            {
-                variables.push(TypedVariable {
-                    var_type: classify_variable(token),
-                    raw: token.clone(),
-                });
+        let template = if let Some(cluster) = self.id_to_cluster.peek(cluster_id) {
+            let param_str = &self.config.param_string;
+            for (i, token) in content_tokens.iter().enumerate() {
+                if i < cluster.log_template_tokens.len()
+                    && cluster.log_template_tokens[i] == *param_str
+                {
+                    variables.push(TypedVariable {
+                        var_type: classify_variable(token),
+                        raw: token.clone(),
+                    });
+                }
             }
-        }
+            cluster.log_template_tokens.join(" ")
+        } else {
+            String::new()
+        };
 
         ParsedLog {
-            pattern_id: cluster.id,
-            template: cluster.get_template(),
-            count: cluster.size as u64,
+            pattern_id: cluster_id,
+            template,
+            count: cluster_size as u64,
             variables,
         }
     }
 
-    fn tree_search_impl(
+    fn tree_search_impl_fast(
         &mut self,
         tokens: &[String],
         sim_th: f64,
         include_params: bool,
-    ) -> Option<LogCluster> {
+    ) -> Option<usize> {
         let token_count = tokens.len();
         let token_count_str = token_count.to_string();
 
-        // Check if the first level exists
         if !self
             .root_node
             .key_to_child_node
@@ -371,12 +421,10 @@ impl Drain {
             return None;
         }
 
-        // Find the path to the correct node, collecting cluster IDs
-        let mut cluster_ids = Vec::new();
+        let cluster_ids: Vec<usize>;
         {
             let cur_node = &self.root_node.key_to_child_node[&token_count_str];
 
-            // handle case of empty log string
             if token_count == 0 {
                 if !cur_node.cluster_ids.is_empty() {
                     cluster_ids = cur_node.cluster_ids.clone();
@@ -384,25 +432,20 @@ impl Drain {
                     return None;
                 }
             } else {
-                // Navigate through the tree
                 let mut cur_node = cur_node;
                 let mut cur_node_depth = 1;
                 let param_str = &self.config.param_string;
                 let max_depth = self.config.max_node_depth;
 
                 for i in 0..tokens.len() {
-                    // at max depth
                     if cur_node_depth >= max_depth {
                         break;
                     }
-
-                    // this is last token
                     if cur_node_depth == token_count {
                         break;
                     }
 
                     let token = &tokens[i];
-
                     if cur_node.key_to_child_node.contains_key(token) {
                         cur_node = &cur_node.key_to_child_node[token];
                     } else if cur_node.key_to_child_node.contains_key(param_str) {
@@ -414,13 +457,28 @@ impl Drain {
                     cur_node_depth += 1;
                 }
 
-                // Store cluster IDs from the found node
                 cluster_ids = cur_node.cluster_ids.clone();
             }
         }
 
-        // Now that we have the cluster IDs, find the best match
-        self.fast_match(&cluster_ids, tokens, sim_th, include_params)
+        self.fast_match_id(&cluster_ids, tokens, sim_th, include_params)
+    }
+
+    fn tree_search_impl(
+        &mut self,
+        tokens: &[String],
+        sim_th: f64,
+        include_params: bool,
+    ) -> Option<LogCluster> {
+        if let Some(id) = self.tree_search_impl_fast(tokens, sim_th, include_params) {
+            self.id_to_cluster.peek(id).map(|c| LogCluster {
+                log_template_tokens: c.log_template_tokens.clone(),
+                id: c.id,
+                size: c.size,
+            })
+        } else {
+            None
+        }
     }
 
     // Helper method to update the prefix tree while avoiding borrow issues
@@ -506,6 +564,44 @@ impl Drain {
         self.fast_match(&cur_node.cluster_ids, tokens, sim_th, include_params)
     }
 
+    fn fast_match_id(
+        &mut self,
+        cluster_ids: &[usize],
+        tokens: &[String],
+        sim_th: f64,
+        include_params: bool,
+    ) -> Option<usize> {
+        let mut max_sim: f64 = -1.0;
+        let mut max_param_count: i32 = -1;
+        let mut best_id: Option<usize> = None;
+
+        let param_string = &self.config.param_string as *const String;
+
+        for &cluster_id in cluster_ids {
+            if let Some(cluster) = self.id_to_cluster.peek(cluster_id) {
+                // SAFETY: param_string points to self.config.param_string which is not moved
+                let (cur_sim, param_count) = get_seq_distance_static(
+                    &cluster.log_template_tokens,
+                    tokens,
+                    include_params,
+                    unsafe { &*param_string },
+                );
+
+                if cur_sim > max_sim || (cur_sim == max_sim && param_count > max_param_count) {
+                    max_sim = cur_sim;
+                    max_param_count = param_count;
+                    best_id = Some(cluster_id);
+                }
+            }
+        }
+
+        if max_sim >= sim_th {
+            best_id
+        } else {
+            None
+        }
+    }
+
     // fastMatch Find the best match for a log message (represented as tokens) versus a list of clusters
     fn fast_match(
         &mut self,
@@ -514,39 +610,12 @@ impl Drain {
         sim_th: f64,
         include_params: bool,
     ) -> Option<LogCluster> {
-        let mut max_sim = -1.0;
-        let mut max_param_count = -1;
-        let mut max_cluster: Option<LogCluster> = None;
-
-        // Extract the param_string before the loop to avoid borrowing conflicts
-        let param_string = self.config.param_string.clone();
-
-        for &cluster_id in cluster_ids {
-            // Try to retrieve cluster from cache with bypassing eviction algorithm
-            if let Some(cluster) = self.id_to_cluster.peek(cluster_id) {
-                // Calculate similarity without borrowing self
-                let (cur_sim, param_count) = get_seq_distance_static(
-                    &cluster.log_template_tokens,
-                    tokens,
-                    include_params,
-                    &param_string,
-                );
-
-                if cur_sim > max_sim || (cur_sim == max_sim && param_count > max_param_count) {
-                    max_sim = cur_sim;
-                    max_param_count = param_count;
-
-                    max_cluster = Some(LogCluster {
-                        log_template_tokens: cluster.log_template_tokens.clone(),
-                        id: cluster.id,
-                        size: cluster.size,
-                    });
-                }
-            }
-        }
-
-        if max_sim >= sim_th {
-            max_cluster
+        if let Some(id) = self.fast_match_id(cluster_ids, tokens, sim_th, include_params) {
+            self.id_to_cluster.peek(id).map(|c| LogCluster {
+                log_template_tokens: c.log_template_tokens.clone(),
+                id: c.id,
+                size: c.size,
+            })
         } else {
             None
         }

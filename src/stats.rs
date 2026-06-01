@@ -124,7 +124,6 @@ impl CategoricalStats {
             }
             if let Some(ref mut hll) = self.hll {
                 hll.insert(&value.to_string());
-                self.cached_unique = hll.count().round() as u64;
             }
         } else {
             *self.exact_counts.entry(value.to_string()).or_insert(0) += 1;
@@ -136,7 +135,6 @@ impl CategoricalStats {
                 for key in self.exact_counts.keys() {
                     hll.insert(key);
                 }
-                self.cached_unique = hll.count().round() as u64;
                 self.hll = Some(hll);
             }
         }
@@ -144,6 +142,14 @@ impl CategoricalStats {
 
     pub fn unique_count(&self) -> u64 {
         self.cached_unique
+    }
+
+    pub fn finalize_count(&mut self) {
+        if self.capped {
+            if let Some(ref mut hll) = self.hll {
+                self.cached_unique = hll.count().round() as u64;
+            }
+        }
     }
 
     /// Returns top-k entries as (value, count, percentage)
@@ -335,9 +341,11 @@ impl PatternStore {
             .entry(pattern_id)
             .or_insert_with(|| PatternStats::new(pattern_id, template.to_string(), ctx));
 
-        // Always update template to the latest from Drain3 — it evolves
-        // as more lines are seen (more positions become <*>)
-        stats.template = template.to_string();
+        // Update template only if it changed — avoids allocation on every line
+        if stats.template != template {
+            stats.template.clear();
+            stats.template.push_str(template);
+        }
 
         stats.count += 1;
         if stats.first_seen_line == 0 {
@@ -375,10 +383,11 @@ impl PatternStore {
         stats.example_lines.push(raw_line.to_string());
     }
 
-    /// Run post-accumulation fixups (enum reclassification, etc.)
+    /// Run post-accumulation fixups (enum reclassification, HLL finalization, etc.)
     pub fn finalize(&mut self) {
         for stats in self.patterns.values_mut() {
             for var in &mut stats.variables {
+                var.categorical.finalize_count();
                 var.check_enum_reclassify();
             }
         }
